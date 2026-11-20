@@ -1,0 +1,1155 @@
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_common.hpp b/sdk/platform/opxy-1.2.1/aux_lfo_common.hpp
+new file mode 100644
+index 0000000..c27d1ee
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_common.hpp
+@@ -0,0 +1,18 @@
++#pragma once
++#include <opxy/types.hpp>
++namespace aux_lfo {
++using opxy::i32;
++using opxy::u32;
++using opxy::u8;
++enum Source { Stock, Gyro, Mic, Duck, Sine, Square, Falling, Rising, Random, DuckNote, SourceCount };
++const u32 targets = 3, patterns = 16;
++inline u32 index(u32 track) { return track == 11 ? 0 : track == 14 ? 1 : track == 15 ? 2 : targets; }
++inline bool tagged(i32 word) {
++    const u32 value = static_cast<u32>(word);
++    const u32 mode = value & 15u;
++    return (value & 0xfff00000u) == 0x4af00000u && mode > Stock && mode < SourceCount;
++}
++inline i32 token(u32 generation, u32 mode) {
++    return static_cast<i32>(0x4af00000u | ((generation & 0xffffu) << 4) | mode);
++}
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_display.hpp b/sdk/platform/opxy-1.2.1/aux_lfo_display.hpp
+new file mode 100644
+index 0000000..38d6579
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_display.hpp
+@@ -0,0 +1,45 @@
++#pragma once
++#include "aux_lfo_common.hpp"
++
++namespace aux_lfo {
++enum StockPage { ValuePage = 27, RandomPage, ElementPage, DuckPage };
++inline i32 display_page(u32 source) {
++    switch (source) {
++    case Gyro: case Mic: return ElementPage;
++    case Duck: case DuckNote: return DuckPage;
++    case Sine: case Square: case Falling: case Rising: return ValuePage;
++    case Random: return RandomPage;
++    default: return -1;
++    }
++}
++// Return the middle of a stock selector bucket in nonnegative Q31.
++inline i32 sixth(u32 choice) {
++    const i32 middle[] = {178956970, 536870912, 894784853, 1252698794, 1610612736, 1968526677};
++    return middle[choice];
++}
++inline u32 aux_group(i32 value) {
++    // As in the AUX destination resolver: ((word >> 8) * 3) >> 23.
++    return value <= 0 ? 0 : ((static_cast<u32>(value) >> 8) * 3) >> 23;
++}
++inline void display_words(u32 mode, const i32* in, i32 (&out)[8]) {
++    for (u32 i = 0; i != 8; ++i) out[i] = in[i];
++    if (mode == Duck || mode == DuckNote) {
++        out[4] = mode == DuckNote ? 2147483647 : 0;
++        return;
++    }
++    const u32 group = aux_group(in[2]);
++    if (mode == Gyro || mode == Mic) {
++        out[0] = mode == Mic ? 0x20000000 : 0;
++        out[2] = static_cast<i32>((group << 29) + 0x10000000);
++        return;
++    }
++    // Value and Random are free-running on AUX. Their original pages offer
++    // two positions per destination group, with free in the second position.
++    out[2] = sixth(2 * group + 1);
++    if (mode == Random) {
++        out[7] = in[3]; // Random renders its destination slot from word 31.
++        out[3] = 0x40000000; // No instrument-triggered fade on the AUX oscillator.
++    }
++    else if (mode >= Sine && mode <= Rising) out[4] = static_cast<i32>((mode - Sine) << 29);
++}
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_duck.hpp b/sdk/platform/opxy-1.2.1/aux_lfo_duck.hpp
+new file mode 100644
+index 0000000..bf3088a
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_duck.hpp
+@@ -0,0 +1,60 @@
++#pragma once
++#include <opxy/q31.hpp>
++
++namespace aux_lfo {
++using opxy::i32;
++
++struct DuckControls {
++    i32 source, amount, hold, release, source_type; // stock non-negative Q31 words
++};
++
++struct DuckState {
++    // Native accesses use offsets relative to the start of this buffer.
++    // 0x80..0x87 hold two histories; 0x88 holds the first of 64 per-sample results.
++    i32 kernel[0x88 / sizeof(i32) + 64];
++    i32 words[29]; // Stock parameter block through source-type word 28.
++    bool initialized;
++};
++
++extern "C" void sdk_aux_duck_kernel(i32* state, unsigned private_index,
++                                    const i32* controls) __asm__("sdk_aux_duck_kernel");
++
++inline void duck_reset(DuckState& s) {
++    // Clear on *entry*, once. A BSS-zeroed instance has the same behaviour.
++    s.initialized = false;
++}
++
++inline i32 duck_step(DuckState& s, const DuckControls& controls) {
++    const i32 amount = controls.amount < 0 ? 0 : controls.amount;
++    const i32 hold = controls.hold < 0 ? 0 : controls.hold;
++    const i32 release = controls.release < 0 ? 0 : controls.release;
++    const bool new_coefficients = !s.initialized || s.words[25] != amount ||
++                                 s.words[26] != hold || s.words[27] != release;
++    if (!s.initialized) {
++        for (auto& value : s.kernel) value = 0;
++        s.kernel[0x78 / 4] = 1; // Stock refreshes the stages from the pristine histories.
++        s.initialized = true;
++    }
++    s.words[24] = controls.source < 0 ? 0 : controls.source;
++    s.words[25] = amount;
++    s.words[26] = hold;
++    s.words[27] = release;
++    s.words[28] = controls.source_type < 0 ? 0 : controls.source_type;
++    // Stock's compare uses the hold word, but its compute branch stores amount.
++    // Recompute on edits to any coefficient input and reuse them while steady.
++    s.kernel[0x70 / 4] = new_coefficients ? -1 : hold;
++    s.kernel[0x74 / 4] = release;
++    sdk_aux_duck_kernel(s.kernel, 0, s.words);
++    // Instrument volume's stock destination consumes the first sample of the output block.
++    // A positive result cannot duck. Bound unexpected input to unity (no change).
++    const i32 raw = s.kernel[0x88 / 4];
++    return raw < 0 ? opxy::q31::multiply(raw, amount) : 0;
++}
++
++inline i32 duck_delta(i32 base, i32 depth_scaled_envelope) {
++    // The AUX destination takes an additive delta; the equivalent of ducking
++    // a normalized control by a fractional amount is base * (-attenuation).
++    return base > 0 && depth_scaled_envelope < 0
++        ? opxy::q31::multiply(base, depth_scaled_envelope) : 0;
++}
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_element.cpp b/sdk/platform/opxy-1.2.1/aux_lfo_element.cpp
+new file mode 100644
+index 0000000..3dba9f5
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_element.cpp
+@@ -0,0 +1,40 @@
++#include "element_stock.hpp"
++
++namespace {
++
++aux_lfo::ElementMic mic;
++bool using_internal_lane;
++
++bool mic_selected(unsigned track) {
++    const opxy::u32 address = 0x84eab39cu + 4u * (58u * track + 57u);
++    return (opxy::platform::word(address) & 0xfff0000fu) == 0x4af00002u;
++}
++
++aux_lfo::CaptureStamp capture_stamp() {
++    // 11a02a04 / 11a02a06 write these two words before calling 8d4ff32c.
++    // Producer and consumer run serially on the audio role.
++    return {opxy::platform::word(0x08034f68), opxy::platform::word(0x08034f6c)};
++}
++
++} // namespace
++
++opxy::i32 aux_lfo::mic_q31_from_stock() {
++    return mic_read(mic, capture_stamp());
++}
++
++opxy::u32 aux_lfo_mic_input_lane() {
++    const opxy::u32 original = opxy::platform::stock<opxy::u32()>(0x8d4db364)();
++    using_internal_lane = original == 0;
++    return original;
++}
++
++void aux_lfo_observe_mic(opxy::u32 source, const opxy::i32* pairs) {
++    const bool internal = using_internal_lane && source == 14 && pairs;
++    using_internal_lane = false;
++    if (mic_selected(11) || mic_selected(14) || mic_selected(15)) {
++        aux_lfo::mic_observe(mic, pairs, internal, capture_stamp());
++    } else if (mic.active) {
++        mic = {};
++    }
++    opxy::platform::stock<void(opxy::u32, const opxy::i32*)>(0x8d51a3c8)(source, pairs);
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_hooks.s b/sdk/platform/opxy-1.2.1/aux_lfo_hooks.s
+new file mode 100644
+index 0000000..3ff30f9
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_hooks.s
+@@ -0,0 +1,54 @@
++.section .text
++.align 2
++.extern sdk_aux_lfo_evaluate
++.global sdk_aux_lfo_resolve
++.type sdk_aux_lfo_resolve, STT_FUNC
++sdk_aux_lfo_resolve:
++    /* A tagged live word is published only for a selected, owned source. */
++    R3 = [P2 + 228];
++    R3 >>= 20;
++    R0 = 0x4af (Z);
++    CC = R3 == R0;
++    IF CC JUMP 1f;
++    P1.L = 0xf348;
++    P1.H = 0x8d50;
++    JUMP (P1);
++1:
++    LINK 20;
++    [SP] = R7;
++    [SP + 4] = R1;
++    [SP + 8] = R5;
++    [SP + 12] = R6;
++    SP += -12;
++    P1.L = 0xf348;
++    P1.H = 0x8d50;
++    CALL (P1);
++    SP += 12;
++    [SP + 16] = R0;
++    R0 = SP;
++    SP += -12;
++    CALL sdk_aux_lfo_evaluate;
++    SP += 12;
++    R5 = [SP + 8];
++    R6 = [SP + 12];
++    R0 = [SP + 16];
++    UNLINK;
++    RTS;
++.size sdk_aux_lfo_resolve, .-sdk_aux_lfo_resolve
++
++/* Stock's shifted AUX controller dispatches M4 (key 9) to its own handled
++ * return. Like the adjacent SDK Shift+M1 case, the stock method has LINK 12
++ * and no saved registers. Return handled even on unrelated tracks. */
++.extern sdk_aux_lfo_shift_m4
++.global sdk_aux_lfo_shift_m4_hook
++.type sdk_aux_lfo_shift_m4_hook, STT_FUNC
++sdk_aux_lfo_shift_m4_hook:
++    LINK 0;
++    SP += -12;
++    CALL sdk_aux_lfo_shift_m4;
++    SP += 12;
++    UNLINK;
++    UNLINK;
++    R0 = 1;
++    RTS;
++.size sdk_aux_lfo_shift_m4_hook, .-sdk_aux_lfo_shift_m4_hook
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_runtime.cpp b/sdk/platform/opxy-1.2.1/aux_lfo_runtime.cpp
+new file mode 100644
+index 0000000..bdb2aa4
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_runtime.cpp
+@@ -0,0 +1,40 @@
++// OS 1.2.1 audio-side AUX control evaluator, one invocation per enabled AUX tick.
++#include "aux_lfo_common.hpp"
++#include "aux_lfo_duck.hpp"
++#include "aux_value_random_stock.hpp"
++#include "element_stock.hpp"
++
++namespace aux_lfo {
++struct Frame { u32 track; const i32* words; i32 depth, wave; u32 slot; };
++static_assert(sizeof(void*) != 4 || sizeof(Frame) == 20, "Blackfin callback layout");
++struct Voice { DuckState duck; ValueRandomState oscillator; i32 tag; };
++Voice voices[targets];
++
++extern "C" void sdk_aux_lfo_evaluate(Frame*) __asm__("sdk_aux_lfo_evaluate");
++extern "C" void sdk_aux_lfo_evaluate(Frame* f) {
++    const u32 n = index(f->track);
++    if (n >= targets || !f->words) return;
++    const i32 tag = f->words[57];
++    const u32 mode = static_cast<u32>(tag) & 15u;
++    if (!tagged(tag) || !mode || mode >= SourceCount) return;
++    Voice& v = voices[n];
++    if (v.tag != tag) {
++        v.tag = tag;
++        reset_value_random(v.oscillator, 0x9e3779b9u * (n + 1u));
++        duck_reset(v.duck);
++    }
++    if (mode == Gyro) f->wave = gyro_q31_from_stock();
++    else if (mode == Mic) f->wave = mic_q31_from_stock();
++    else if (mode == Random) f->wave = random_wave_stock(v.oscillator, f->words[24]);
++    else if (mode >= Sine && mode <= Rising) f->wave = value_wave_stock(v.oscillator, f->words[24], mode - Sine);
++    else if (mode == Duck || mode == DuckNote) {
++        const DuckControls controls = {f->words[24], f->words[25], f->words[26], f->words[27],
++                                       mode == DuckNote ? 2147483647 : 0};
++        f->slot = f->track == 11 ? 3u : 41u;
++        // Instrument Duck's raw amount is unipolar. The AUX post-hook
++        // multiplier therefore uses unity after applying that amount once.
++        f->wave = duck_delta(f->words[f->slot], duck_step(v.duck, controls));
++        f->depth = 2147483647;
++    }
++}
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_lfo_ui.inc b/sdk/platform/opxy-1.2.1/aux_lfo_ui.inc
+new file mode 100644
+index 0000000..94740ab
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_lfo_ui.inc
+@@ -0,0 +1,111 @@
++// GUI side; called from the existing AUX service. A source belongs to a target's
++// current pattern. Exchange only a tagged live word with the audio role.
++using opxy::u8;
++u8 mode_bank[aux_lfo::targets][aux_lfo::patterns];
++struct PublishedMode { u32 pattern, mode, generation; };
++PublishedMode publications[aux_lfo::targets];
++u32 lifecycle;
++enum Family { Plain, DuckFamily, ElementFamily, RandomFamily, ValueFamily, FamilyCount };
++const char* const family_names[FamilyCount] = {"stock", "duck", "element", "random", "value"};
++const aux_lfo::Source family_defaults[FamilyCount] = {
++    aux_lfo::Stock, aux_lfo::Duck, aux_lfo::Gyro, aux_lfo::Random, aux_lfo::Sine
++};
++// Companion files and the GUI/audio handoff keep the A2 source IDs.
++Family family_of(u32 source) {
++    switch (source) {
++    case aux_lfo::Duck: case aux_lfo::DuckNote: return DuckFamily;
++    case aux_lfo::Gyro: case aux_lfo::Mic: return ElementFamily;
++    case aux_lfo::Random: return RandomFamily;
++    case aux_lfo::Sine: case aux_lfo::Square: case aux_lfo::Falling: case aux_lfo::Rising: return ValueFamily;
++    default: return Plain;
++    }
++}
++browser::StockSelector<FamilyCount> mode_selector;
++struct ModeSelection { u32 track, pattern, project, block, lifecycle; };
++ModeSelection selection;
++bool modulation_track(u32 track) {
++    if (track == 14 || track == 15) return true;
++    if (track != kCv) return false;
++    const ControlMachine* m = holder(track);
++    if (!m || !m->shared_lfo || !m->name) return false;
++    const char name[] = "morphcapture";
++    for (u32 n = 0; n < sizeof name; ++n) if (m->name[n] != name[n]) return false;
++    return true;
++}
++void store_modulation(u32 track, u32 pattern, u32 source) {
++    u8& saved = mode_bank[aux_lfo::index(track)][pattern];
++    if (saved == source) return;
++    saved = static_cast<u8>(source);
++    // Project dirty byte and edit counter, as GUI engine setter 0x8d5877e4.
++    *at<volatile u8>(0x840a052c) = 1;
++    ++*at<volatile u32>(0x840a0530);
++}
++void choose_modulation(void*, u32 family) {
++    const u32 t = selection.track;
++    if (family >= FamilyCount || word(kProjectLoading) || selection.lifecycle != lifecycle ||
++        selection.project != word(0x840a0524) || t != byte(kSelectedTrack) ||
++        selection.block != current_block(t) || !modulation_track(t)) return;
++    if (family != family_of(mode_bank[aux_lfo::index(t)][selection.pattern]))
++        store_modulation(t, selection.pattern, family_defaults[family]);
++}
++// Return the active source on the selected target's M4. Plain AUX or the
++// machine's own pages retain their normal controls.
++u32 editable_modulation(u32 track) {
++    if (word(kAuxTab) != 3 || !word(0x840a0524) || word(kProjectLoading) || !modulation_track(track))
++        return aux_lfo::Stock;
++    const u32 pattern = current_pattern(track);
++    return pattern < aux_lfo::patterns ? mode_bank[aux_lfo::index(track)][pattern] : aux_lfo::Stock;
++}
++bool modulation_k1_click(u32 track) {
++    const u32 source = editable_modulation(track);
++    u32 next;
++    if (source == aux_lfo::Duck || source == aux_lfo::DuckNote)
++        next = source == aux_lfo::Duck ? aux_lfo::DuckNote : aux_lfo::Duck;
++    else if (source >= aux_lfo::Sine && source <= aux_lfo::Rising)
++        next = source == aux_lfo::Rising ? aux_lfo::Sine : source + 1;
++    else return false;
++    store_modulation(track, current_pattern(track), next);
++    return true;
++}
++bool modulation_element_turn(u32 track, u32 event) {
++    const u32 source = editable_modulation(track);
++    if (source != aux_lfo::Gyro && source != aux_lfo::Mic) return false;
++    const i32 detents = at<const i32>(event)[1];
++    if (detents) store_modulation(track, current_pattern(track), detents > 0 ? aux_lfo::Mic : aux_lfo::Gyro);
++    return true;
++}
++bool open_modulation(u32 track) {
++    if (word(kProjectLoading) || !word(0x840a0524) || !modulation_track(track)) return false;
++    const u32 pattern = current_pattern(track);
++    if (pattern >= aux_lfo::patterns) return false;
++    const ModeSelection next = {track, pattern, word(0x840a0524), current_block(track), lifecycle};
++    const browser::Callbacks callbacks = {nullptr, choose_modulation, nullptr, nullptr};
++    if (!mode_selector.open("lfo", family_names, FamilyCount, family_of(mode_bank[aux_lfo::index(track)][pattern]), callbacks, track)) return false;
++    selection = next;
++    return true;
++}
++i32 modulation_mark(u32 track, i32 fallback) {
++    const u32 target = aux_lfo::index(track);
++    if (target >= aux_lfo::targets) return fallback;
++    const u32 pattern = current_pattern(track);
++    const u32 mode = pattern < aux_lfo::patterns && !word(kProjectLoading) && modulation_track(track) && byte(current_block(track) + 0x24)
++                     ? mode_bank[target][pattern] : 0;
++    PublishedMode& p = publications[target];
++    if (mode != p.mode || pattern != p.pattern) { ++p.generation; p.mode = mode; p.pattern = pattern; }
++    return mode ? aux_lfo::token(p.generation, mode) : fallback;
++}
++void modulation_tick() {
++    if (!word(0x840a0524)) return;
++    // The CV role can be returned to plain CV between two visits to the
++    // same Morph pattern. A reacquisition must start fresh oscillator/Duck state.
++    if (publications[0].mode && !modulation_track(kCv)) {
++        publications[0].mode = 0;
++        ++publications[0].generation;
++    }
++    for (u32 t = 14; t <= 15; ++t) {
++        const i32 now = live(t, kMarkWord);
++        const i32 desired = modulation_mark(t, 0);
++        if (desired && now != desired) live_set(t, kMarkWord, desired);
++        else if (!desired && aux_lfo::tagged(now)) live_set(t, kMarkWord, base(t, kMarkWord));
++    }
++}
+diff --git a/sdk/platform/opxy-1.2.1/aux_tracks.cpp b/sdk/platform/opxy-1.2.1/aux_tracks.cpp
+index a75b7ea..fba43a9 100644
+--- a/sdk/platform/opxy-1.2.1/aux_tracks.cpp
++++ b/sdk/platform/opxy-1.2.1/aux_tracks.cpp
+@@ -67,3 +67,8 @@ opxy::i32 sdk_aux_page() __asm__("sdk_aux_page");
+ opxy::u32 sdk_aux_key(opxy::u32, const opxy::u32*) __asm__("sdk_aux_key");
++#ifdef OPXY_AUX_LFO
++opxy::u32 sdk_aux_turn(opxy::u32, opxy::u32, opxy::u32) __asm__("sdk_aux_turn_default");
++opxy::u32 sdk_aux_lfo_turn(opxy::u32, opxy::u32, opxy::u32) __asm__("sdk_aux_turn");
++#else
+ opxy::u32 sdk_aux_turn(opxy::u32, opxy::u32, opxy::u32) __asm__("sdk_aux_turn");
++#endif
+ opxy::u32 sdk_effect_turn(opxy::u32, opxy::u32, opxy::u32, opxy::u32) __asm__("sdk_effect_turn");
+@@ -76,2 +81,6 @@ void sdk_cv_gate_on(opxy::u32, opxy::u32, opxy::u32) __asm__("sdk_cv_gate_on");
+ 
++#ifdef OPXY_AUX_LFO
++#include "aux_lfo_display.hpp"
++#endif
++
+ namespace {
+@@ -170,4 +179,17 @@ void live_set(u32 track, u32 index, i32 value) {
+ // so the role stays silent from the first word the machine sets.
++#ifdef OPXY_AUX_LFO
++#include "aux_lfo_ui.inc"
++#endif
++bool held_mark(i32 value) {
++#ifdef OPXY_AUX_LFO
++    if (aux_lfo::tagged(value)) return true;
++#endif
++    return value == kAuxMark;
++}
+ void mark(u32 track) {
+-    if (live(track, kMarkWord) != kAuxMark) live_set(track, kMarkWord, kAuxMark);
++    i32 desired = kAuxMark;
++#ifdef OPXY_AUX_LFO
++    desired = modulation_mark(track, desired);
++#endif
++    if (live(track, kMarkWord) != desired) live_set(track, kMarkWord, desired);
+     marked[track] = true;
+@@ -469,3 +491,3 @@ bool cv_held() {
+     const i32 last = audio_words(kCv)[kMarkWord];
+-    if (last == kAuxMark) cv_missing = 0;
++    if (held_mark(last)) cv_missing = 0;
+     else if (last == kAuxRelease) cv_missing = kHeldCalls;
+@@ -530,2 +552,14 @@ void sdk_aux_shift_m1() {
+ 
++#ifdef OPXY_AUX_LFO
++// Give a discrete Element source turn to its owner, then delegate other
++// turns to the same AUX dispatcher used by stock and installed machines.
++u32 sdk_aux_lfo_turn(u32 controller, u32 encoder, u32 event) {
++    if (encoder == 0 && event && modulation_element_turn(byte(kSelectedTrack), event)) return 1;
++    return sdk_aux_turn(controller, encoder, event);
++}
++// Called solely from the Shift+M4 case of the stock AUX controller.
++extern "C" void sdk_aux_lfo_shift_m4() __asm__("sdk_aux_lfo_shift_m4");
++void sdk_aux_lfo_shift_m4() { open_modulation(byte(kSelectedTrack)); }
++#endif
++
+ // 8c08f610: Shift + track key on an aux track. On one a machine holds, its
+@@ -543,3 +577,42 @@ bool owns_page(u32 track) {
+ // Tabs inherited from another track/pattern resolve to the machine's page.
++#ifdef OPXY_AUX_LFO
++extern "C" u32 sdk_aux_lfo_screen_mode(u32 track) __asm__("sdk_aux_lfo_screen_mode");
++u32 sdk_aux_lfo_screen_mode(u32 track) {
++    if (aux_lfo::index(track) == aux_lfo::targets || track != byte(kSelectedTrack)) return aux_lfo::Stock;
++    return editable_modulation(track);
++}
++
++namespace {
++// Draw calls on stock pages use the eight-word vector returned by 8d4d7de8.
++// The AUX M4 page uses that same getter. Only the caller's copy is adapted.
++struct LfoVector { u32 allocator; const i32 *begin, *end, *capacity; };
++static_assert(sizeof(void*) != 4 || sizeof(LfoVector) == 16, "Stock control vector");
++const LfoVector* lfo_display_vector(u32 track, i32 page) {
++    const LfoVector* input = stock<const LfoVector*(u32)>(0x8d4d7de8)(track);
++    const u32 mode = sdk_aux_lfo_screen_mode(track);
++    if (aux_lfo::display_page(mode) != page || !input || !input->begin ||
++        input->end - input->begin != 8) return input;
++    static i32 words[8];
++    static LfoVector view;
++    view.allocator = input->allocator;
++    view.begin = words; view.end = view.capacity = words + 8;
++    aux_lfo::display_words(mode, input->begin, words);
++    return &view;
++}
++}
++#define AUX_LFO_DRAW(name, page) \
++    extern "C" const LfoVector* name(u32 t) __asm__(#name); \
++    const LfoVector* name(u32 t) { return lfo_display_vector(t, aux_lfo::page); }
++AUX_LFO_DRAW(sdk_aux_lfo_draw_duck, DuckPage)
++AUX_LFO_DRAW(sdk_aux_lfo_draw_element, ElementPage)
++AUX_LFO_DRAW(sdk_aux_lfo_draw_random, RandomPage)
++AUX_LFO_DRAW(sdk_aux_lfo_draw_value, ValuePage)
++#undef AUX_LFO_DRAW
++#endif
++
+ i32 sdk_aux_page() {
++#ifdef OPXY_AUX_LFO
++    const i32 page = aux_lfo::display_page(sdk_aux_lfo_screen_mode(byte(kSelectedTrack)));
++    if (page >= 0) return page;
++#endif
+     const ControlMachine* m = holder(byte(kSelectedTrack));
+@@ -557,2 +630,5 @@ u32 sdk_aux_key(u32 controller, const u32* event) {
+     const ControlMachine* m = holder(track);
++#ifdef OPXY_AUX_LFO
++    if (event && event[0] == 10 && modulation_k1_click(track)) return 2;
++#endif
+     if (!m || !event) return 0;
+@@ -612,3 +688,3 @@ void sdk_cv_output(u32 argument) {
+ void sdk_cv_gate_on(u32 a, u32 b, u32 c) {
+-    if (cv_missing >= kHeldCalls && audio_words(kCv)[kMarkWord] != kAuxMark)
++    if (cv_missing >= kHeldCalls && !held_mark(audio_words(kCv)[kMarkWord]))
+         stock<void(u32, u32, u32)>(0x8d5b5fe0)(a, b, c);
+@@ -658 +734,20 @@ void sdk_aux_startup() {
+ }
++
++#ifdef OPXY_AUX_LFO
++void aux_lfo_standalone_tick() {
++    if (word(0x840a0524)) modulation_tick();
++}
++void aux_lfo_restore_modes(const opxy::u8* bytes, opxy::u32 count) {
++    ++lifecycle;
++    for (u32 t = 0; t < aux_lfo::targets; ++t) {
++        ++publications[t].generation;
++        publications[t].mode = 0;
++        for (u32 p = 0; p < aux_lfo::patterns; ++p) {
++            const u32 offset = t * aux_lfo::patterns + p;
++            const u32 mode = bytes && count == sizeof(mode_bank) ? bytes[offset] : 0;
++            mode_bank[t][p] = mode < aux_lfo::SourceCount ? static_cast<u8>(mode) : 0;
++        }
++    }
++}
++const opxy::u8* aux_lfo_mode_bytes() { return &mode_bank[0][0]; }
++#endif
+diff --git a/sdk/platform/opxy-1.2.1/aux_value_random.hpp b/sdk/platform/opxy-1.2.1/aux_value_random.hpp
+new file mode 100644
+index 0000000..7c0c194
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_value_random.hpp
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include <opxy/q31.hpp>
++
++namespace aux_lfo {
++
++struct ValueRandomState {
++    opxy::u32 phase;
++    opxy::u32 sequence;
++    opxy::i32 held;
++    opxy::i32 smoothed;
++};
++
++inline void reset_value_random(ValueRandomState &state, opxy::u32 seed) {
++    state.phase = 0;
++    state.sequence = seed;
++    state.held = 0;
++    state.smoothed = 0;
++}
++
++// OS 1.2.1 instrument Value and Random interpret their rate word identically.
++inline opxy::u32 value_random_increment(opxy::i32 rate_word, opxy::u32 stock_tempo_increment) {
++    const opxy::u32 rate = rate_word > 0 ? static_cast<opxy::u32>(rate_word) >> 17 : 0;
++    if (rate < 8192u) return stock_tempo_increment >> (rate >> 10);
++    const opxy::i32 distance = static_cast<opxy::i32>(rate - 8192u) * 65536;
++    return static_cast<opxy::u32>(opxy::q31::multiply(distance, distance));
++}
++
++// One control sample at the start of the stock 64-sample Value block.
++// The instrument divides its phase step by 64 before advancing waveform samples.
++inline opxy::i32 value_wave(ValueRandomState &state, opxy::u32 increment, opxy::u32 shape,
++                            const volatile opxy::i16 *sine_table) {
++    const opxy::u32 phase = state.phase;
++    state.phase += increment & ~63u;
++    switch (shape) {
++        case 0: return static_cast<opxy::i32>(sine_table[phase >> 19]) * 65536;
++        case 1: return (phase & 0x80000000u) ? (-2147483647 - 1) : 2147418112;
++        case 2: return static_cast<opxy::i32>((65535u - (phase >> 16)) >> 1) * 65536;
++        case 3: return static_cast<opxy::i32>((phase >> 16) >> 1) * 65536;
++        default: return 0;
++    }
++}
++
++inline opxy::i32 random_sample_blend(opxy::u32 increment) {
++    const opxy::i32 base = 16777216;
++    const opxy::u32 threshold = 21474836;
++    if (increment <= threshold) return base;
++    // The native evaluator supports signed positive increments. A caller may use
++    // the entire unsigned range to fast-forward the clock; clamp for the blend.
++    const opxy::i32 limited = increment > 2147483647u ? 2147483647 : static_cast<opxy::i32>(increment);
++    const opxy::i32 distance = limited - static_cast<opxy::i32>(threshold);
++    return base + opxy::q31::multiply(opxy::q31::shift_left(distance, 5), 268435456);
++}
++
++inline opxy::i32 random_wave(ValueRandomState &state, opxy::u32 increment) {
++    const opxy::u32 previous = state.phase;
++    state.phase += increment;
++    if (state.phase < previous) {
++        state.sequence = state.sequence * 1664525u + 1013904223u;
++        const opxy::i32 high = static_cast<opxy::i32>(state.sequence >> 16);
++        state.held = (high >= 32768 ? high - 65536 : high) * 65536;
++    }
++    if (state.smoothed == state.held) return state.smoothed;
++
++    // Advance the one-pole through 64 native samples with six Q31 squares.
++    // This is an end-of-block control sample. Intermediate audio samples are
++    // unnecessary for AUX modulation; fixed-point rounding differs by a few LSBs.
++    opxy::i32 old_weight = opxy::q31::maximum - random_sample_blend(increment);
++    for (unsigned power = 0; power < 6; ++power) {
++        old_weight = opxy::q31::multiply(old_weight, old_weight);
++    }
++    state.smoothed = opxy::q31::add(opxy::q31::multiply(old_weight, state.smoothed),
++                                    opxy::q31::multiply(opxy::q31::maximum - old_weight, state.held));
++    return state.smoothed;
++}
++
++}  // namespace aux_lfo
+diff --git a/sdk/platform/opxy-1.2.1/aux_value_random_stock.hpp b/sdk/platform/opxy-1.2.1/aux_value_random_stock.hpp
+new file mode 100644
+index 0000000..f1613c3
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/aux_value_random_stock.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include "aux_value_random.hpp"
++
++namespace aux_lfo {
++
++// Audio CPU, OS 1.2.1 only. Callers must authenticate the OS profile before
++// installing the binding. These aliases use read-only native data.
++inline opxy::u32 value_random_stock_increment(opxy::i32 rate_word) {
++    const volatile opxy::u32 *tempo = reinterpret_cast<const volatile opxy::u32 *>(0x840426f4u);
++    return value_random_increment(rate_word, *tempo);
++}
++
++inline opxy::i32 value_wave_stock(ValueRandomState &state, opxy::i32 rate_word, opxy::u32 shape) {
++    const volatile opxy::i16 *sine = reinterpret_cast<const volatile opxy::i16 *>(0x84048aa4u);
++    return value_wave(state, value_random_stock_increment(rate_word), shape, sine);
++}
++
++inline opxy::i32 random_wave_stock(ValueRandomState &state, opxy::i32 rate_word) {
++    return random_wave(state, value_random_stock_increment(rate_word));
++}
++
++}  // namespace aux_lfo
+diff --git a/sdk/platform/opxy-1.2.1/element.hpp b/sdk/platform/opxy-1.2.1/element.hpp
+new file mode 100644
+index 0000000..e2d5c59
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/element.hpp
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include <opxy/q31.hpp>
++
++namespace aux_lfo {
++
++inline opxy::i32 gyro_q31(opxy::i16 motion) {
++    const opxy::i32 reversed = -static_cast<opxy::i32>(motion);
++    return (reversed > 32767 ? 32767 : reversed) * 65536;
++}
++
++// Read only on the audio role. The stock DMA service records this cycle pair
++// before each input callback, including a callback with no input buffer.
++struct CaptureStamp {
++    opxy::u32 low;
++    opxy::u32 high;
++};
++
++struct ElementMic {
++    opxy::i32 first;
++    opxy::i32 second;
++    CaptureStamp captured;
++    bool active;
++};
++
++// Stock Element computes two cascaded Q31 one-pole followers. The fixed
++// coefficients below are derived from the stock 10/200 ms defaults at 44.1 kHz
++// (1% remaining after the nominal time). No floating point in audio.
++inline opxy::i32 mic_pole(opxy::i32 old, opxy::i32 target) {
++    const opxy::i32 coefficient = old < target ? 2125175096 : 2146362679;
++    // Both operands lie in [0, INT_MAX], so neither the difference nor
++    // target + the weighted difference can overflow.
++    return target + opxy::q31::multiply(old - target, coefficient);
++}
++
++inline void mic_observe(ElementMic& state, const opxy::i32* pairs,
++                        bool internal_mic, CaptureStamp stamp) {
++    state.active = internal_mic && pairs;
++    state.captured = stamp;
++    if (!internal_mic || !pairs) {
++        state.first = state.second = 0;
++        return;
++    }
++    for (unsigned i = 0; i < 64; ++i) {
++        // Same ordering as instrument Element: abs(max(a,b)).
++        const opxy::i32 a = *pairs++;
++        const opxy::i32 b = *pairs++;
++        const opxy::i32 max = a > b ? a : b;
++        const opxy::i32 magnitude = max >= 0 ? max :
++            (max == -2147483647 - 1 ? 2147483647 : -max);
++        state.first = mic_pole(state.first, magnitude);
++        state.second = mic_pole(state.second, state.first);
++    }
++}
++
++inline opxy::i32 mic_read(ElementMic& state, CaptureStamp current) {
++    const bool fresh = state.active && current.low == state.captured.low &&
++                       current.high == state.captured.high;
++    if (!fresh) state.first = state.second = 0;
++    return state.second;
++}
++
++} // namespace aux_lfo
+diff --git a/sdk/platform/opxy-1.2.1/element_stock.hpp b/sdk/platform/opxy-1.2.1/element_stock.hpp
+new file mode 100644
+index 0000000..81af57a
+--- /dev/null
++++ b/sdk/platform/opxy-1.2.1/element_stock.hpp
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include "element.hpp"
++#include <stock.hpp>
++
++namespace aux_lfo {
++
++// Audio role. Both consumers use the existing AUX depth and destination route.
++inline opxy::i32 gyro_q31_from_stock() {
++    return gyro_q31(opxy::platform::stock<opxy::i16()>(0x8d4db5bc)());
++}
++
++opxy::i32 mic_q31_from_stock();
++
++} // namespace aux_lfo
++
++extern "C" void aux_lfo_observe_mic(opxy::u32 source, const opxy::i32* pairs)
++    __asm__("aux_lfo_observe_mic");
++
++extern "C" opxy::u32 aux_lfo_mic_input_lane() __asm__("aux_lfo_mic_input_lane");
+diff --git a/sdk/platform/opxy-1.2.1/lfo.cpp b/sdk/platform/opxy-1.2.1/lfo.cpp
+index eba967c..750b0bb 100644
+--- a/sdk/platform/opxy-1.2.1/lfo.cpp
++++ b/sdk/platform/opxy-1.2.1/lfo.cpp
+@@ -1,2 +1,6 @@
+ #include "lfo.hpp"
++#ifdef OPXY_AUX_LFO
++#include "aux_lfo_common.hpp"
++extern "C" opxy::u32 sdk_aux_lfo_screen_mode(opxy::u32 track) __asm__("sdk_aux_lfo_screen_mode");
++#endif
+ 
+@@ -59,2 +63,15 @@ u32 sdk_lfo_icon_slot(u32 slot, u32 enabled) {
+ const char* sdk_lfo_label(u32 group, u32 slot, u32 flag) {
++#ifdef OPXY_AUX_LFO
++    const u32 track = lfo::selected_track();
++    if (aux_lfo::index(track) < aux_lfo::targets) {
++        const u32 mode = sdk_aux_lfo_screen_mode(track);
++        if (mode == aux_lfo::Gyro || mode == aux_lfo::Mic ||
++            (mode >= aux_lfo::Sine && mode <= aux_lfo::Random)) {
++            // Stock AUX names index fixed four-entry tables. A bad selector
++            // must never index them, even during an intermediate draw.
++            if (group > 2 || slot >= 4) return "-";
++            return lfo::aux_name(track, group, slot);
++        }
++    }
++#endif
+     if (group == 0 && slot < parameter_slots) {
+diff --git a/sdk/platform/opxy-1.2.1/lfo.hpp b/sdk/platform/opxy-1.2.1/lfo.hpp
+index c85d70b..9209e41 100644
+--- a/sdk/platform/opxy-1.2.1/lfo.hpp
++++ b/sdk/platform/opxy-1.2.1/lfo.hpp
+@@ -21,2 +21,5 @@ u32 animate(u32 controller, u32 position, i32 target, u32 duration);
+ const char* name(u32 group, u32 slot, u32 flag);
++#ifdef OPXY_AUX_LFO
++const char* aux_name(u32 track, u32 group, u32 slot);
++#endif
+ void show(u32 widget);
+diff --git a/sdk/platform/opxy-1.2.1/lfo_stock.cpp b/sdk/platform/opxy-1.2.1/lfo_stock.cpp
+index 8626e7f..773a119 100644
+--- a/sdk/platform/opxy-1.2.1/lfo_stock.cpp
++++ b/sdk/platform/opxy-1.2.1/lfo_stock.cpp
+@@ -14,2 +14,8 @@ const char* name(u32 group, u32 slot, u32 flag) {
+ }
++#ifdef OPXY_AUX_LFO
++const char* aux_name(u32 track, u32 group, u32 slot) {
++    // Same resolver as AUX M4, including the SDK's engine-name hook on Morph.
++    return stock<const char*(u32, u32, u32)>(0x8d53d160)(track, group, slot);
++}
++#endif
+ void show(u32 widget) { *reinterpret_cast<volatile u8*>(widget + 0x5c) = 0; }
+diff --git a/sdk/platform/opxy-1.2.1/synth_controls.cpp b/sdk/platform/opxy-1.2.1/synth_controls.cpp
+index 085df15..067afeb 100644
+--- a/sdk/platform/opxy-1.2.1/synth_controls.cpp
++++ b/sdk/platform/opxy-1.2.1/synth_controls.cpp
+@@ -1 +1,5 @@
++#ifdef OPXY_AUX_LFO
++#include "aux_lfo_common.hpp"
++extern "C" opxy::u32 sdk_aux_lfo_screen_mode(opxy::u32 track) __asm__("sdk_aux_lfo_screen_mode");
++#endif
+ // Stock OS 1.2.1 instrument-track encoders for synths with alternate controls.
+@@ -416,2 +420,12 @@ u32 sdk_param_steps(u32 track, u32 index, u32* scale) {
+         return 0xffffffffu;
++#ifdef OPXY_AUX_LFO
++    // The instrument Duck classifier (8c0b2634) returns 17 for source,
++    // continuous for amount, hold and release. Keep the caller's stock
++    // scale, detent acceleration, lock editor and GUI-to-audio publication.
++    if ((track == 11 || track == 14 || track == 15) && index >= 24 && index <= 27) {
++        const u32 mode = sdk_aux_lfo_screen_mode(track);
++        if (mode == aux_lfo::Duck || mode == aux_lfo::DuckNote)
++            return index == 24 ? 17u : 0xffffffffu;
++    }
++#endif
+     return stock<u32(u32, u32, u32*)>(0x8c0b2468)(track, index, scale);
+diff --git a/sdk/platform/opxy-1.2.1/synth_pages.cpp b/sdk/platform/opxy-1.2.1/synth_pages.cpp
+index 3b8ebc1..2df8572 100644
+--- a/sdk/platform/opxy-1.2.1/synth_pages.cpp
++++ b/sdk/platform/opxy-1.2.1/synth_pages.cpp
+@@ -39,3 +39,9 @@ u32 key_track = kAllTracks, key_number;
+ 
++#ifdef OPXY_AUX_LFO
++extern void aux_lfo_standalone_tick();
++#endif
+ void sdk_synth_pages() {
++#ifdef OPXY_AUX_LFO
++    aux_lfo_standalone_tick();
++#endif
+     const u32 track = selected_track();
+diff --git a/sdk/platform/opxy-1.2.1/track_control.cpp b/sdk/platform/opxy-1.2.1/track_control.cpp
+index 1178e20..2b3dd40 100644
+--- a/sdk/platform/opxy-1.2.1/track_control.cpp
++++ b/sdk/platform/opxy-1.2.1/track_control.cpp
+@@ -480,2 +480,5 @@ extern "C" void sdk_gui_tick() {
+                 i32& last = input.values[u][control::track_parameters - 1];
++#ifdef OPXY_AUX_LFO
++                if ((static_cast<u32>(last) & 0xfff00000u) == 0x4af00000u) last = base(u, control::track_parameters - 1);
++#endif
+                 if (last == kAuxMark || last == kAuxRelease) last = base(u, control::track_parameters - 1);
+diff --git a/sdk/platform/opxy-1.2.1/track_control_project.cpp b/sdk/platform/opxy-1.2.1/track_control_project.cpp
+index c53fbde..a40a6b8 100644
+--- a/sdk/platform/opxy-1.2.1/track_control_project.cpp
++++ b/sdk/platform/opxy-1.2.1/track_control_project.cpp
+@@ -23,2 +23,7 @@ extern "C" opxy::u32 sdk_project_clear_random(opxy::u32, opxy::u32, opxy::u32) _
+ 
++#ifdef OPXY_AUX_LFO
++#include "aux_lfo_common.hpp"
++void aux_lfo_restore_modes(const opxy::u8*, opxy::u32);
++const opxy::u8* aux_lfo_mode_bytes();
++#endif
+ namespace {
+@@ -228,2 +233,5 @@ void load_kept(const char* path) {
+         keeping = keeping || sdk_control_machines[i].load || sdk_control_machines[i].aux;
++#ifdef OPXY_AUX_LFO
++    keeping = true;
++#endif
+     if (!keeping) return;  // nothing to give back: no project I/O
+@@ -240,2 +248,8 @@ void load_kept(const char* path) {
+     const Reader r = {found ? length : 0};
++#ifdef OPXY_AUX_LFO
++    u32 lfo_at, lfo_to, lfo_count = 0;
++    const u32 lfo_bytes = aux_lfo::targets * aux_lfo::patterns;
++    if (found && r.member(at, to, "lfoModes", lfo_at, lfo_to)) lfo_count = r.base64(lfo_at, lfo_to, lfo_bytes);
++    aux_lfo_restore_modes(kept, lfo_count);
++#endif
+     u32 machines_at, machines_to, aux_at, aux_to;
+@@ -272,2 +286,5 @@ void load_kept(const char* path) {
+ void forget_kept() {
++#ifdef OPXY_AUX_LFO
++    aux_lfo_restore_modes(nullptr, 0);
++#endif
+     sdk_control_forget();
+@@ -312,2 +329,15 @@ extern "C" u32 sdk_control_kept_write(void* file) {
+     if (held) out.put("\n        }\n      },\n");
++#ifdef OPXY_AUX_LFO
++    const u32 lfo_bytes = aux_lfo::targets * aux_lfo::patterns;
++    const opxy::u8* modes = aux_lfo_mode_bytes();
++    bool have_modes = false;
++    for (u32 i = 0; i < lfo_bytes; ++i) if (modes[i]) have_modes = true;
++    if (have_modes) {
++        if (!held) out.put("    \"open-xy.control\": {\n");
++        out.put("      \"lfoModes\": \"");
++        out.base64(modes, lfo_bytes);
++        out.put("\",\n");
++        ++held;
++    }
++#endif
+     // Machines by ID, as the canonical form sorts keys.
+diff --git a/tests/test_aux_lfo_review.py b/tests/test_aux_lfo_review.py
+new file mode 100644
+index 0000000..15ba8fc
+--- /dev/null
++++ b/tests/test_aux_lfo_review.py
+@@ -0,0 +1,28 @@
++"""Bound the decoder exception to the authenticated bytes and their ELF symbol."""
++import unittest
++from unittest.mock import patch
++from tooling.aux_lfo_review import recognize_duck
++from tooling.formats import sha
++
++
++class DuckCode(unittest.TestCase):
++    def test_known_graft_only(self):
++        base = 0x10000
++        body = bytes(682)
++        image = b'xyz!' + body + b'next'
++        symbols = {'sdk_aux_duck_kernel': {'value': base + 4, 'size': len(body), 'type': 2}}
++        text = {'address': base, 'size': len(image)}
++        listing = '10000: ILLEGAL\n10004: ILLEGAL\n102ac: ILLEGAL\n102ae: ILLEGAL\n'
++        def review(data):
++            return recognize_duck(listing, {'module_base': base}, symbols, data, text)
++        with patch('tooling.aux_lfo_review.NATIVE_SHA', sha(body)):
++            output = review(image)
++            self.assertIn('10000: ILLEGAL', output)
++            self.assertIn('102ae: ILLEGAL', output)
++            self.assertIn('10004: BLACKFIN_PLUS_STOCK', output)
++            self.assertIn('102ac: BLACKFIN_PLUS_STOCK', output)
++            with self.assertRaises(ValueError):
++                review(image[:5] + b'!' + image[6:])
++            symbols['sdk_aux_duck_kernel']['size'] += 1
++            with self.assertRaises(ValueError):
++                review(image)
+diff --git a/tests/test_pipeline.py b/tests/test_pipeline.py
+index 21ef63d..413c3d0 100644
+--- a/tests/test_pipeline.py
++++ b/tests/test_pipeline.py
+@@ -104,3 +104,3 @@ class Services(unittest.TestCase):
+         self.assertEqual(steps(machines), [u for u in native.SDK_UNITS if native.UNIT_SERVICES.get(u) not in
+-                                          ('control', 'aux', 'players', 'master_filter', 'drum_sends', 'drum_locks',
++                                          ('control', 'aux', 'aux_lfo', 'players', 'master_filter', 'drum_sends', 'drum_locks',
+                                            'drumline', 'synth_shift')])
+@@ -118,4 +118,12 @@ class Services(unittest.TestCase):
+         self.assertEqual(steps(paged), [u for u in native.SDK_UNITS if native.UNIT_SERVICES.get(u) not in
+-                                        ('control', 'aux', 'players', 'master_filter', 'synth_shift')])
++                                        ('control', 'aux', 'aux_lfo', 'players', 'master_filter', 'synth_shift')])
+         self.assertEqual(native.subset(paged, paged[:1]).extensions, (page,))
++        from tooling.aux_lfo_profile import configure
++        configure(profile)
++        sources = native.Collection([], [replace(probe, id='aux_lfo')])
++        planned = {step for _, _, step in native.plan(sources, profile)}
++        self.assertTrue(set(native.AUX_LFO_UNITS) <= planned)
++        unrelated = {step for _, _, step in native.plan(machines, profile)}
++        self.assertFalse(set(native.AUX_LFO_UNITS) & unrelated)
++
+         without = [m for m in machines if m.kind not in ('sample', 'drum')]  # nor any extension
+diff --git a/tooling/aux_lfo_duck_stock.py b/tooling/aux_lfo_duck_stock.py
+new file mode 100644
+index 0000000..3a05a10
+--- /dev/null
++++ b/tooling/aux_lfo_duck_stock.py
+@@ -0,0 +1,68 @@
++"""Prepare the isolated OS 1.2.1 Duck generator from the owner's stock image."""
++import hashlib
++import struct
++
++from tooling.formats import ldr, mapped_offset, require
++
++STOCK_SHA = "60358afdaa9b58ed40411602f6d5d4e1e3e02553ff2da7e25038e71dd002b52f"
++KERNEL_START = 0x8d5044d4
++KERNEL_END = 0x8d504774
++NATIVE_SHA = "b4d0927d13354b6343e6e7008562c8a69ccf771e8e3d925eaa7bc7f897670bb9"
++NATIVE_SIZE = 682
++# P1.L = 0xa130; P1.H = 0x8d51; JUMP (P1). No relocations.
++COEFFICIENT_TAIL = struct.pack("<5H", 0xe109, 0xa130, 0xe149, 0x8d51, 0x0051)
++KERNEL_SHA = "636780dc86bc7e62a852ad1ec2aa3754e88ff4564c80fad7e4e4940ded48c07e"
++
++
++def private_pointer(register, offset):
++    # Four 16-bit Blackfin instructions, keeping all original offsets intact.
++    # Pn = P4; Pn += 48; Pn += 48; Pn += offset-96. Pointer arithmetic leaves
++    # CC and DSP accumulator registers available to the original generator.
++    require(96 <= offset <= 159 and 0 <= register <= 2, "Duck private pointer range")
++    move_from_p4 = 0x3000 | (1 << 9) | (1 << 6) | (register << 3) | 4
++    def add_pointer(value):
++        return 0x6c00 | (value << 3) | register
++    return struct.pack("<4H", move_from_p4, add_pointer(48),
++                       add_pointer(48), add_pointer(offset - 96))
++
++
++def isolated_code(stock):
++    require(hashlib.sha256(stock).hexdigest() == STOCK_SHA, "Duck requires verified OS 1.2.1")
++    at = mapped_offset(ldr(stock), KERNEL_START, KERNEL_END - KERNEL_START)
++    code = bytearray(stock[at:at + KERNEL_END - KERNEL_START])
++    require(hashlib.sha256(code).hexdigest() == KERNEL_SHA, "Unexpected Duck kernel")
++    def replace(pc, old, new):
++        start = pc - KERNEL_START
++        require(len(old) == len(new) and code[start:start + len(old)] == old,
++                f"Duck instruction mismatch at {pc:#x}")
++        code[start:start + len(old)] = new
++
++    # Original state occupies [0x00,0x79). Pass private logical index zero.
++    # All three former global pointers are now offsets in the SAME instance.
++    replace(0x8d504556, bytes.fromhex("08da0308b88c0000"), private_pointer(0, 0x84))
++    replace(0x8d50455e, bytes.fromhex("09da0308988c0000"), private_pointer(1, 0x80))
++    replace(0x8d50461e, bytes.fromhex("0ada9011002b0000"), private_pointer(2, 0x88))
++
++    # The two relative calls into stock both compute envelope coefficients.
++    # Target a local tail trampoline with a full absolute callee address.
++    # Other calls use fixed BF707 CALL.A immediates; short branches and
++    # hardware-loop bounds are internal and unmoved relative to each other.
++    for pc, old in ((0x8d5046e8, "00e324ad"), (0x8d504744, "00e3f6ac")):
++        distance = (KERNEL_END - pc) // 2
++        replace(pc, bytes.fromhex(old), struct.pack("<HH", 0xe300, distance))
++    return bytes(code)
++
++
++def write_asm(stock, path):
++    """Write privately generated assembly to the current build's scratch folder."""
++    code = isolated_code(stock) + COEFFICIENT_TAIL
++    require(len(code) == NATIVE_SIZE and hashlib.sha256(code).hexdigest() == NATIVE_SHA,
++            "Isolated Duck code differs from the approved native routine")
++    lines = [
++        '.section .text', '.align 4', '.global sdk_aux_duck_kernel',
++        '.type sdk_aux_duck_kernel, STT_FUNC', 'sdk_aux_duck_kernel:',
++    ]
++    for start in range(0, len(code), 16):
++        lines.append('    .byte ' + ','.join(f'0x{v:02x}' for v in code[start:start+16]))
++    lines.append('.size sdk_aux_duck_kernel, .-sdk_aux_duck_kernel')
++    path.write_text('\n'.join(lines) + '\n')
+diff --git a/tooling/aux_lfo_profile.py b/tooling/aux_lfo_profile.py
+new file mode 100644
+index 0000000..f506088
+--- /dev/null
++++ b/tooling/aux_lfo_profile.py
+@@ -0,0 +1,22 @@
++"""OS 1.2.1 AUX modulation service, enabled only by the selected extension."""
++from .pipeline import check_patch_boundaries
++
++def configure(profile):
++    profile['services']['aux_lfo'] = ['aux_lfo']
++    profile.setdefault('extension_private_services', {})['aux_lfo'] = 'aux_lfo'
++    for name, address, offset, before, symbol in (
++        ('Stock duck display parameters on AUX', '0x8d542946', '0x179ba2', 'fce351aa', 'sdk_aux_lfo_draw_duck'),
++        ('Stock element display parameters on AUX', '0x8d53fade', '0x176d3a', 'fce385c1', 'sdk_aux_lfo_draw_element'),
++        ('Stock random display parameters on AUX', '0x8d540a9a', '0x177cf6', 'fce3a7b9', 'sdk_aux_lfo_draw_random'),
++        ('Stock value display parameters on AUX', '0x8d543220', '0x17a47c', 'fce3e4a5', 'sdk_aux_lfo_draw_value'),
++        ('AUX source and destination', '0x8d50f3f6', '0x146652', 'ffe3a9ff', 'sdk_aux_lfo_resolve'),
++        ('Microphone input lane used in this block', '0x8d4ff38c', '0x1365e8', 'fee3ecdf', 'aux_lfo_mic_input_lane'),
++        ('Physical mic observer', '0x8d4ff3c8', '0x136624', '00e300d8', 'aux_lfo_observe_mic'),
++    ):
++        profile['patches'].append(dict(kind='hook', name=name, address=address, file_offset=offset,
++                                       length=4, before=before, symbol=symbol, call=True, service='aux_lfo'))
++    profile['patches'].append(dict(
++        kind='hook', name='Shift+M4 opens the AUX modulation chooser',
++        address='0x8c08f704', file_offset='0xc6940', length=8, before='01e8000008601000',
++        symbol='sdk_aux_lfo_shift_m4_hook', call=True, service='aux_lfo'))
++    check_patch_boundaries(profile, len(profile['patches']))
+diff --git a/tooling/aux_lfo_review.py b/tooling/aux_lfo_review.py
+new file mode 100644
+index 0000000..42d52dd
+--- /dev/null
++++ b/tooling/aux_lfo_review.py
+@@ -0,0 +1,21 @@
++"""Authorize decoder limitations only inside the byte-exact OS 1.2.1 Duck graft."""
++import re
++from .aux_lfo_duck_stock import NATIVE_SHA
++from .formats import require, sha
++
++
++def recognize_duck(disassembly, profile, symbols, module, text):
++    symbol = symbols.get('sdk_aux_duck_kernel', {})
++    begin, size = symbol.get('value', 0), symbol.get('size', 0)
++    offset = begin - profile['module_base']
++    require(symbol.get('type') == 2 and size == 682 and 0 <= offset and
++            offset + size <= len(module) and text['address'] <= begin and
++            begin + size <= text['address'] + text['size'] and
++            sha(module[offset:offset + size]) == NATIVE_SHA,
++            'Changed or unbounded native Duck routine')
++    # The pinned disassembler decodes most existing Blackfin+ stock opcodes.
++    # Keep every row and relocation. Annotate its unknown-opcode diagnostic
++    # only when the address lies in this exact authenticated routine.
++    def label(match):
++        return match[0].replace('ILLEGAL', 'BLACKFIN_PLUS_STOCK') if begin <= int(match[1], 16) < begin + size else match[0]
++    return re.sub(r'^\s*([0-9a-f]+):[^\n]*\bILLEGAL\b[^\n]*', label, disassembly, flags=re.MULTILINE)
+diff --git a/tooling/native.py b/tooling/native.py
+index ae7edad..afa02a9 100644
+--- a/tooling/native.py
++++ b/tooling/native.py
+@@ -115,2 +115,5 @@ def configuration(entries=None, layout=None):
+     extensions.check_profile(profile)
++    if any(e.get('extension') and extensions.extension_at(e['extension']).id == 'aux_lfo' for e in entries or ()):
++        from .aux_lfo_profile import configure
++        configure(profile)
+     require([p['kind'] for p in profile['patches']].count('startup') == 1, 'Expected one startup label edit')
+@@ -260,2 +263,5 @@ UNIT_SERVICES = dict.fromkeys(('sample_machines', 'sample_hooks', 'sample_callba
+ UNIT_SERVICES.update(dict.fromkeys(('players', 'player_hooks', 'player_table'), 'players'))
++AUX_LFO_UNITS = ('aux_lfo_runtime', 'aux_lfo_element', 'aux_lfo_hooks', 'aux_lfo_duck_kernel')
++SDK_UNITS += AUX_LFO_UNITS
++UNIT_SERVICES.update(dict.fromkeys(AUX_LFO_UNITS, 'aux_lfo'))
+ UNIT_SERVICES['keyboard_octaves'] = 'octaves'
+@@ -303,3 +309,4 @@ def service_users(machines):
+             (['drumline_page'] if any(e.drumline_page is not None for e in extensions_of(machines)) else []) +
+-            [c for e in extensions_of(machines) for c in e.capabilities])
++            [c for e in extensions_of(machines) for c in e.capabilities] +
++            (['trackControl', 'auxTrack', 'aux_lfo'] if any(e.id == 'aux_lfo' for e in extensions_of(machines)) else []))
+ 
+@@ -514,3 +521,3 @@ def linked_machines(directory, tools, profile, machines, definitions, runtime_me
+ def compile_collection(directory, toolchain, compiler, profile, machines, definitions, version, profiling=True,
+-                       sweep=False):
++                       sweep=False, *, aux_lfo_stock=None):
+     """Compile every machine and link those that fit (linked_machines), labelled with the
+@@ -530,2 +537,4 @@ def compile_collection(directory, toolchain, compiler, profile, machines, defini
+ 
++    selected_services = active_services(profile, service_users(machines))
++
+     def assemble_unit(source, obj):
+@@ -565,2 +574,12 @@ def compile_collection(directory, toolchain, compiler, profile, machines, defini
+                 return cxx(str(generate_synth_controls(folder, machines)), obj)
++            if step == 'aux_lfo_duck_kernel':
++                from .aux_lfo_duck_stock import write_asm
++                require(aux_lfo_stock is not None, 'The selected AUX modulation extension needs the authenticated stock OS')
++                source = folder / 'aux_lfo_duck_kernel.s'
++                write_asm(aux_lfo_stock, source)
++                return assemble_unit(source, obj)
++            if 'aux_lfo' in selected_services and step in ('aux_tracks', 'synth_controls', 'track_control', 'track_control_project', 'synth_pages', 'lfo', 'lfo_stock'):
++                source = folder / (step + '_aux_lfo.cpp')
++                source.write_text('#define OPXY_AUX_LFO 1\n#include "' + TEMPLATES + step + '.cpp"\n', encoding='utf-8')
++                return cxx(str(source.resolve()), obj)
+             if step == 'player_table':
+@@ -888,2 +907,5 @@ def check_module(directory, tools, profile, machines, profiling=True, runtime_me
+     disassembly = execute([tools['objdump'], '-h', '-dr', elf])
++    if 'aux_lfo' in active_services(profile, service_users(machines)):
++        from .aux_lfo_review import recognize_duck
++        disassembly = recognize_duck(disassembly, profile, symbols, module, allocated['.text'])
+     # The startup label thunk uses Blackfin+ absolute CALL/JUMP forms objdump
+@@ -1177,3 +1199,3 @@ def verification(stock, catalog, package, toolchain, compiler, *, require_record
+         module, report, patch_profile = compile_collection(temporary, toolchain, compiler, profile, machines,
+-                                                           definitions, package_version(package), profiling, sweep)
++                                                           definitions, package_version(package), profiling, sweep, **({'aux_lfo_stock': stock} if 'aux_lfo' in profile['services'] else {}))
+         require(report['profiling'] is profiling, 'Compile profiling differs from manifest')
+@@ -1230,3 +1252,3 @@ def build(out, toolchain, compiler, stock_os, stock_content, entries=None, layou
+     module, report, patch_profile = compile_collection(analysis, toolchain, compiler, profile, machines,
+-                                                       definitions, version, profiling, sweep)
++                                                       definitions, version, profiling, sweep, **({'aux_lfo_stock': stock} if 'aux_lfo' in profile['services'] else {}))
+     prepared = prepare_assets(catalog, profile, linked_in(machines, report))
+@@ -1283,4 +1305,4 @@ def main(argv=None, command=None):
+         add_overwrite_argument(parser)
++    parser.add_argument('--stock-os', type=Path, required=command != 'compile')
+     if command != 'compile':
+-        parser.add_argument('--stock-os', type=Path, required=True)
+         parser.add_argument('--stock-content', type=Path, default=STOCK_CONTENT,
+@@ -1321,3 +1343,3 @@ def main(argv=None, command=None):
+                                                            startup_label.release_version(), args.profiling == 'on',
+-                                                           sweep)
++                                                           sweep, aux_lfo_stock=read(args.stock_os) if args.stock_os else None)
+             print(json.dumps(report['sizes'], indent=2))

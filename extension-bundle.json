@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "id": "aux_lfo",
+  "name": "AUX modulation",
+  "version": "1.0.0",
+  "sdk": "1.16",
+  "sdkCommit": "28dd1a2e36599108c5eecf1a03f3b28601e50b39",
+  "extension": "extension/aux_lfo",
+  "measurementRequiresStock": true,
+  "claims": [
+    "hook:aux-lfo-stage1",
+    "service:aux-modulation"
+  ],
+  "patches": [
+    {
+      "path": "integration/extension-only-collection.patch",
+      "sha256": "c8c09e189ffb04b8c93fa7fd7207ebb61eebaf0883849881bbae26ff4d5cdee9"
+    },
+    {
+      "path": "integration/aux-lfo-service.patch",
+      "sha256": "b48fc94f4dec0f819aed75cfb762eac2e5c855a0a4277c6c3c68bcf7a13ad81d"
+    }
+  ],
+  "repository": "https://github.com/erhenius/OP-XY-AUX-Modulation"
+}

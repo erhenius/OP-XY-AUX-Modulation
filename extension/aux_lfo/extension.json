@@ -1,0 +1,7 @@
+{
+  "id": "aux_lfo",
+  "name": "AUX modulation",
+  "description": "Select a modulation type with Shift+M4 on FX I, FX II or the Morph AUX track.",
+  "claims": [],
+  "actions": []
+}

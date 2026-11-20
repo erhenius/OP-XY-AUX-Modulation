@@ -1,0 +1,98 @@
+diff --git a/tests/test_startup.py b/tests/test_startup.py
+index 2c38ab3..e5c394e 100644
+--- a/tests/test_startup.py
++++ b/tests/test_startup.py
+@@ -27,8 +27,13 @@ class Startup(unittest.TestCase):
+             self.assertIn(f'__asm__("{prefix}_engine_id")', text)
+         self.assertNotIn('probesample_screen_register', text)
+ 
++    def test_extension_only_startup(self):
++        text = render([])
++        self.assertIn('void sdk_startup_screen() {', text)
++        self.assertIn('return stock_catalog_insert(catalog, name, id);', text)
++
+     def test_rejects_invalid_machine_lists(self):
+-        for prefixes in ([], ['probesynth', 'probesynth'], ['Bad'], ['x%d' % i for i in range(ENGINE_COUNT + 1)]):
++        for prefixes in (['probesynth', 'probesynth'], ['Bad'], ['x%d' % i for i in range(ENGINE_COUNT + 1)]):
+             with self.subTest(prefixes=prefixes[:3]), self.assertRaises(ValueError):
+                 render(prefixes)
+         for effects, stock_page in ((['probesynth'], ()), ((), ['other'])):
+diff --git a/tooling/machines.py b/tooling/machines.py
+index 39e390f..710a983 100644
+--- a/tooling/machines.py
++++ b/tooling/machines.py
+@@ -882,11 +882,10 @@ def read_collection(path=None, extra=(), extensions=()):
+ def collection(entries=None, layout=None):
+     """Machines in firmware order, with their numbers in the layout: the order sets
+     startup, catalog and link layout, never numbers. Entries come from read_collection."""
+-    entries = [e for e in ([] if entries is None else entries) if 'path' in e]
+-    require(isinstance(entries, list) and entries,
+-            'Collection needs machines: pass --machine <folder>, or --collection local/catalog/collection.json '
+-            'after python sdk.py catalog fetch')
+-    machines = [machine_at(e['path']) for e in entries]
++    require(entries and all(isinstance(e, dict) and set(e) in ({'path'}, {'extension'}) for e in entries),
++            'Collection needs machines or extensions: pass --machine <folder>, --extension <folder>, '
++            'or --collection local/catalog/collection.json after python sdk.py catalog fetch')
++    machines = [machine_at(e['path']) for e in entries if 'path' in e]
+     identities = [m.id for m in machines]
+     require(len(set(identities)) == len(identities), 'Collection needs distinct machines')
+     machines, _numbers = assign_numbers(machines, layout)
+diff --git a/tooling/native.py b/tooling/native.py
+index 8c98c79..c36935f 100644
+--- a/tooling/native.py
++++ b/tooling/native.py
+@@ -332,6 +332,23 @@ def memory_by_owner(directory, machines, profile=None, runtime_members=()):
+     return usage
+ 
+ 
++def extension_memory(directory, machines, profile):
++    """Exclusive extension allocations contained in the existing SDK total, before alignment."""
++    amounts = {e.id: dict(initialized_bytes=0, state_bytes=0) for e in extensions_of(machines)}
++    private_services = profile.get('extension_private_services', {})
++    for name, machine, step in plan(machines, profile):
++        if machine is not None:
++            continue
++        owner = step.removeprefix('extension:') if step.startswith('extension:') else private_services.get(UNIT_SERVICES.get(step))
++        if owner is None:
++            continue
++        require(owner in amounts, 'Unselected extension owns ' + name)
++        data, state = object_memory(read(Path(directory) / name))
++        amounts[owner]['initialized_bytes'] += data
++        amounts[owner]['state_bytes'] += state
++    return amounts
++
++
+ def memory_summary(usage, total, limit):
+     shares = sorted(((owner, sum(share.values())) for owner, share in usage.items()), key=lambda item: -item[1])
+     padding = total - sum(size for _owner, size in shares)
+@@ -625,6 +642,7 @@ def compile_collection(directory, toolchain, compiler, profile, machines, defini
+                   cxx_flags=CXX_FLAGS, profiling=profiling, benchmark_cases=benchmark.cases(linked, sweep),
+                   **({'benchmark_sweep': True} if sweep else {}),
+                   sizes=sizes, memory=usage, module_bytes=module_bytes(profile), audio_stack_bytes=stack,
++                  **({'extension_memory': extension_memory(directory, linked, profile)} if extensions_of(linked) else {}),
+                   reserved_bytes=profile['reserved_bytes'],
+                   module_sha256=sha(module), elf_sha256=sha(read(directory / 'module.elf')), hooks=hooks,
+                   objects=object_owners(linked, profile, runtime_members), patches=patch_profile['patches'],
+@@ -1221,7 +1239,8 @@ def build(out, toolchain, compiler, stock_os, stock_content, entries=None, layou
+     require(sha(stock) == profile['stock_sha256'], 'Stock OS hash mismatch')
+     catalog = read(Path(stock_content) / 'op1_factory.json')
+     require(sha(catalog) == profile['stock_catalog_sha256'], 'Stock catalog hash mismatch')
+-    output = fresh_output(out, overwrite, [toolchain, compiler, stock_os, stock_content, *(m.root for m in machines)])
++    output = fresh_output(out, overwrite, [toolchain, compiler, stock_os, stock_content, *(m.root for m in machines),
++                                                            *(e.root for e in extensions_of(machines))])
+     analysis = output / 'analysis'
+     analysis.mkdir()
+     version = startup_label.release_version()
+diff --git a/tooling/startup.py b/tooling/startup.py
+index e2d70c6..633af92 100644
+--- a/tooling/startup.py
++++ b/tooling/startup.py
+@@ -46,7 +46,7 @@ def render(prefixes, effects=(), stock_page=(), sample_screens=(), effect_screen
+     sdk_drumline_get, defined here: without the service it answers null; with it,
+     the service's sdk_drumline_service, which the browser builder resolves to
+     kit_absent (null) when the selection leaves the extension out."""
+-    require(prefixes or effects or player_pages, 'Startup needs at least one machine')
++    # Extension-only collections produce the stock startup and no machine registrations.
+     require(0 <= len(prefixes) <= ENGINE_COUNT and len(set(prefixes)) == len(prefixes),
+             'Startup needs distinct engine prefixes')
+     require(len(set(effects)) == len(effects) <= EFFECT_COUNT and not set(effects) & set(prefixes),
