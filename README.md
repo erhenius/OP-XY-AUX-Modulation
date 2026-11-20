@@ -2,9 +2,13 @@
 
 Give FX I and FX II their own modulation sources. Duck a reverb tail from a kick, tip the XY to move a delay parameter, or run different LFOs on the two sends. With Morph installed on the CV track, its movement can follow a third independent source. Each track and pattern remembers its choice.
 
-## Install with TE Builder
+## Install
 
-Requires **TE Builder 0.5.8**, **OP-XY OS 1.2.1** and **Open-XY 0.0.7** (SDK API 1.16). TE Builder uses its locally verified stock OS and Blackfin compiler.
+AUX Modulation can be built and installed with the Open-XY SDK alone. It targets OP-XY OS 1.2.1 and Open-XY 0.0.7 (SDK API 1.16).
+
+**Using the Open-XY CLI:** follow the [build and install instructions](docs/BUILD.md). The repository includes both SDK patches and the extension source. Supply your stock OS image and the SDK’s supported Blackfin toolchain.
+
+**Using TE Builder:** version 0.5.8 supports this standalone extension and manages those inputs for you.
 
 - **GitHub** — copy this repository’s HTTPS clone URL into **File → Import Git Repository…**. TE Builder follows the default branch and reads the extension manifest at the repository root.
 - **ZIP** — use **File → Import Machine or Extension ZIP…** and select [AUX-Modulation-1.0.0.zip](release/AUX-Modulation-1.0.0.zip) intact.

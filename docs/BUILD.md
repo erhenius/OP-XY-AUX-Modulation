@@ -1,6 +1,6 @@
 # Building AUX Modulation
 
-TE Builder applies both patches from `extension-bundle.json` in order, verifies their checksums and builds the extension selected in the queue. For a manual build, start with a fresh checkout of Open-XY and the AUX Modulation repository.
+To build with the Open-XY CLI, start with the AUX Modulation source folder, Git and Python 3.11 or newer. The commands below prepare a private SDK checkout and build firmware containing this extension on its own. If your XY already runs other community machines or extensions, include them in the same build and supply your previous layout as described in the pinned SDK build guide.
 
 From the root of AUX Modulation, run the following in one shell. Pick an unused path for the SDK checkout and build output.
 
@@ -24,6 +24,10 @@ python3 sdk.py build --extension "$aux_repo/extension/aux_lfo" --stock-os "$stoc
 ```
 
 The checks exercise the four source families, alternate trigger and waveform choices, GUI and audio parameter routing, project save and restore, and selection across both FX sends and Morph. They require a C++11 host compiler with undefined-behavior sanitizer support. Device playback and native build verification are separate from the host fixtures.
+
+## Install with the Open-XY CLI
+
+After a successful build, follow [Install in the pinned Open-XY guide](https://github.com/etcetc000/open-xy/blob/28dd1a2e36599108c5eecf1a03f3b28601e50b39/docs/build.md#5-install) for the USB setup and the device-side installation. From the same SDK checkout, `python3 sdk.py device push ../aux-modulation-build/candidate` stages the candidate on the connected XY. Complete installation on the XY as described in that guide.
 
 ## Packaging
 
